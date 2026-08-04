@@ -45,6 +45,9 @@ typedef enum dt_pdf_stream_encoder_t
   DT_PDF_STREAM_ENCODER_FLATE     = 1   // use zlib to compress -- small & slow
 } dt_pdf_stream_encoder_t;
 
+typedef void *(*dt_pdf_calloc_func)(size_t count, size_t size);
+typedef void *(*dt_pdf_realloc_func)(void *ptr, size_t size);
+
 typedef struct dt_pdf_t
 {
   FILE                    *fd;
@@ -58,6 +61,8 @@ typedef struct dt_pdf_t
 
   size_t                  *offsets;
   int                      n_offsets;
+  dt_pdf_realloc_func      realloc_operation;
+  gboolean                 failed;
 } dt_pdf_t;
 
 typedef struct dt_pdf_image_t
@@ -115,6 +120,23 @@ static const int dt_pdf_paper_sizes_n =
   sizeof(dt_pdf_paper_sizes) / sizeof(dt_pdf_paper_sizes[0]) - 1;
 
 // construction of the pdf
+dt_pdf_t *dt_pdf_start_with_allocators(
+  const char *filename,
+  float width,
+  float height,
+  float dpi,
+  dt_pdf_stream_encoder_t default_encoder,
+  dt_pdf_calloc_func calloc_operation,
+  dt_pdf_realloc_func realloc_operation);
+
+dt_pdf_t *dt_pdf_start_with_allocator(
+  const char *filename,
+  float width,
+  float height,
+  float dpi,
+  dt_pdf_stream_encoder_t default_encoder,
+  dt_pdf_calloc_func calloc_operation);
+
 dt_pdf_t *dt_pdf_start(const char *filename,
                        const float width,
                        const float height,
@@ -132,12 +154,24 @@ dt_pdf_image_t *dt_pdf_add_image(dt_pdf_t *pdf,
                                  const int bpp,
                                  const int icc_id,
                                  const float border);
+gboolean dt_pdf_add_image_to_list(dt_pdf_t *pdf,
+                                  GList **images,
+                                  const unsigned char *image,
+                                  int width,
+                                  int height,
+                                  int bpp,
+                                  int icc_id,
+                                  float border);
 dt_pdf_page_t *dt_pdf_add_page(dt_pdf_t *pdf,
                                dt_pdf_image_t **images,
                                const int n_images);
-void dt_pdf_finish(dt_pdf_t *pdf,
-                   dt_pdf_page_t **pages,
-                   const int n_pages);
+gboolean dt_pdf_finish(dt_pdf_t *pdf,
+                       dt_pdf_page_t **pages,
+                       const int n_pages);
+gboolean dt_pdf_finish_output(dt_pdf_t *pdf,
+                              dt_pdf_page_t **pages,
+                              const int n_pages,
+                              char **owned_filename);
 
 // general helpers
 int dt_pdf_parse_length(const char *str,

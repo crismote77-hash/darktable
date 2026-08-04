@@ -29,6 +29,8 @@
 #include "imageio/imageio_module.h"
 #include "imageio/format/imageio_format_api.h"
 
+#include <errno.h>
+#include <glib/gstdio.h>
 #include <strings.h>
 
 DT_MODULE(1)
@@ -350,14 +352,13 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
   if(!image_data)
     return 1;
 
-  dt_pdf_image_t *image = dt_pdf_add_image(d->pdf, image_data, d->params.global.width,
-                                           d->params.global.height, d->params.bpp, icc_id,
-                                           d->page_border);
+  const gboolean image_added = dt_pdf_add_image_to_list(
+    d->pdf, &d->images, image_data, d->params.global.width,
+    d->params.global.height, d->params.bpp, icc_id, d->page_border);
 
   dt_free_align(image_data);
 
-  d->images = g_list_append(d->images, image);
-
+  if(!image_added) return 1;
 
   // finish the pdf
   if(num == total)
@@ -383,19 +384,19 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
     // add the contact sheet(s)
     // TODO
 
-    dt_pdf_finish(d->pdf, pages, n_images);
+    const gboolean finish_ok = dt_pdf_finish_output(d->pdf, pages, n_images,
+                                                     &d->actual_filename);
 
     // we allocated the images and pages. the main pdf object gets free'ed in dt_pdf_finish().
     g_list_free_full(d->images, free);
     for(i = 0; i < n_images; i++) free(pages[i]);
     free(pages);
-    g_free(d->actual_filename);
     g_list_free_full(d->icc_profiles, free);
 
     d->pdf = NULL;
     d->images = NULL;
-    d->actual_filename = NULL;
     d->icc_profiles = NULL;
+    if(!finish_ok) return 1;
   } // finish the pdf
 
   return 0;
@@ -771,14 +772,22 @@ void free_params(dt_imageio_module_format_t *self, dt_imageio_module_data_t *par
 {
   dt_imageio_pdf_t *d = (dt_imageio_pdf_t *)params;
 
-  if(d->pdf)
-    dt_pdf_finish(d->pdf, NULL, 0);
+  if(d->pdf && !dt_pdf_finish(d->pdf, NULL, 0))
+    dt_print(DT_DEBUG_ALWAYS, "[pdf] failed to finalize PDF during cleanup");
 
   g_list_free_full(d->images, free);
 
   if(d->actual_filename)
   {
-    g_unlink(d->actual_filename); // no need to leave broken files on disk
+    if(g_unlink(d->actual_filename) != 0)
+    {
+      const int saved_errno = errno;
+      dt_print(DT_DEBUG_ALWAYS,
+               "[pdf] corrupt output remains at `%s': %s",
+               d->actual_filename, g_strerror(saved_errno));
+      dt_control_log(_("corrupt PDF output remains at `%s': %s"),
+                     d->actual_filename, g_strerror(saved_errno));
+    }
     g_free(d->actual_filename);
   }
 

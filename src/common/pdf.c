@@ -192,26 +192,61 @@ end:
 
 static const char *stream_encoder_filters[] = {"/ASCIIHexDecode", "/FlateDecode"};
 
-static void _pdf_set_offset(dt_pdf_t *pdf,
-                            int id,
-                            const size_t offset)
+static gboolean _pdf_set_offset(dt_pdf_t *pdf,
+                                int id,
+                                const size_t offset)
 {
+  if(!pdf || pdf->failed || id <= 0) return FALSE;
   id--; // object ids start at 1
   if(id >= pdf->n_offsets)
   {
-    pdf->n_offsets = MAX(pdf->n_offsets * 2, id);
-    pdf->offsets = realloc(pdf->offsets, sizeof(size_t) * pdf->n_offsets);
+    const gsize new_count = MAX((gsize)pdf->n_offsets * 2, (gsize)id + 1);
+    if(new_count > G_MAXINT || new_count > G_MAXSIZE / sizeof(*pdf->offsets))
+    {
+      errno = ENOMEM;
+      pdf->failed = TRUE;
+      return FALSE;
+    }
+
+    if(!pdf->realloc_operation)
+    {
+      errno = EINVAL;
+      pdf->failed = TRUE;
+      return FALSE;
+    }
+
+    size_t *new_offsets = pdf->realloc_operation(
+      pdf->offsets, sizeof(*pdf->offsets) * new_count);
+    if(!new_offsets)
+    {
+      pdf->failed = TRUE;
+      return FALSE;
+    }
+    memset(new_offsets + pdf->n_offsets, 0,
+           sizeof(*new_offsets) * (new_count - pdf->n_offsets));
+    pdf->offsets = new_offsets;
+    pdf->n_offsets = (int)new_count;
   }
   pdf->offsets[id] = offset;
+  return TRUE;
 }
 
-dt_pdf_t *dt_pdf_start(const char *filename,
-                       const float width,
-                       const float height,
-                       const float dpi,
-                       const dt_pdf_stream_encoder_t default_encoder)
+dt_pdf_t *dt_pdf_start_with_allocators(
+  const char *filename,
+  const float width,
+  const float height,
+  const float dpi,
+  const dt_pdf_stream_encoder_t default_encoder,
+  const dt_pdf_calloc_func calloc_operation,
+  const dt_pdf_realloc_func realloc_operation)
 {
-  dt_pdf_t *pdf = calloc(1, sizeof(dt_pdf_t));
+  if(!calloc_operation || !realloc_operation)
+  {
+    errno = EINVAL;
+    return NULL;
+  }
+
+  dt_pdf_t *pdf = calloc_operation(1, sizeof(dt_pdf_t));
   if(!pdf) return NULL;
 
   pdf->fd = g_fopen(filename, "wb");
@@ -225,16 +260,21 @@ dt_pdf_t *dt_pdf_start(const char *filename,
   pdf->page_height = height;
   pdf->dpi = dpi;
   pdf->default_encoder = default_encoder;
+  pdf->realloc_operation = realloc_operation;
   // object counting starts at 1, and the first 2 are reserved for the
   // document catalog + pages dictionary
   pdf->next_id = 3;
   pdf->next_image = 0;
 
   pdf->n_offsets = 4;
-  pdf->offsets = calloc(pdf->n_offsets, sizeof(size_t));
+  pdf->offsets = calloc_operation(pdf->n_offsets, sizeof(size_t));
   if(!pdf->offsets)
   {
+    const int allocation_errno = errno ? errno : ENOMEM;
+    fclose(pdf->fd);
+    g_unlink(filename);
     free(pdf);
+    errno = allocation_errno;
     return NULL;
   }
   size_t bytes_written = 0;
@@ -257,6 +297,29 @@ dt_pdf_t *dt_pdf_start(const char *filename,
   pdf->bytes_written += bytes_written;
 
   return pdf;
+}
+
+dt_pdf_t *dt_pdf_start_with_allocator(
+  const char *filename,
+  const float width,
+  const float height,
+  const float dpi,
+  const dt_pdf_stream_encoder_t default_encoder,
+  const dt_pdf_calloc_func calloc_operation)
+{
+  return dt_pdf_start_with_allocators(filename, width, height, dpi,
+                                      default_encoder, calloc_operation,
+                                      realloc);
+}
+
+dt_pdf_t *dt_pdf_start(const char *filename,
+                       const float width,
+                       const float height,
+                       const float dpi,
+                       const dt_pdf_stream_encoder_t default_encoder)
+{
+  return dt_pdf_start_with_allocator(filename, width, height, dpi,
+                                     default_encoder, calloc);
 }
 
 // TODO: maybe OpenMP-ify, it's quite fast already (the fwrite is the
@@ -348,7 +411,7 @@ int dt_pdf_add_icc_from_data(dt_pdf_t *pdf,
   size_t bytes_written = 0;
 
   // length of the stream
-  _pdf_set_offset(pdf, icc_id, pdf->bytes_written + bytes_written);
+  if(!_pdf_set_offset(pdf, icc_id, pdf->bytes_written + bytes_written)) return 0;
   bytes_written += fprintf(pdf->fd,
                            "%d 0 obj\n"
                            "<<\n"
@@ -371,7 +434,7 @@ int dt_pdf_add_icc_from_data(dt_pdf_t *pdf,
   );
 
   // length of the stream
-  _pdf_set_offset(pdf, length_id, pdf->bytes_written + bytes_written);
+  if(!_pdf_set_offset(pdf, length_id, pdf->bytes_written + bytes_written)) return 0;
   bytes_written += fprintf(pdf->fd, "%d 0 obj\n"
                                     "%zu\n"
                                     "endobj\n",
@@ -419,7 +482,12 @@ dt_pdf_image_t *dt_pdf_add_image(dt_pdf_t *pdf,
 
   // the image
   //start
-  _pdf_set_offset(pdf, pdf_image->object_id, pdf->bytes_written + bytes_written);
+  if(!_pdf_set_offset(pdf, pdf_image->object_id,
+                      pdf->bytes_written + bytes_written))
+  {
+    free(pdf_image);
+    return NULL;
+  }
   bytes_written += fprintf(pdf->fd,
     "%d 0 obj\n"
     "<<\n"
@@ -464,7 +532,11 @@ dt_pdf_image_t *dt_pdf_add_image(dt_pdf_t *pdf,
   );
 
   // length of the last stream
-  _pdf_set_offset(pdf, length_id, pdf->bytes_written + bytes_written);
+  if(!_pdf_set_offset(pdf, length_id, pdf->bytes_written + bytes_written))
+  {
+    free(pdf_image);
+    return NULL;
+  }
   bytes_written += fprintf(pdf->fd, "%d 0 obj\n"
                                     "%zu\n"
                                     "endobj\n",
@@ -474,6 +546,29 @@ dt_pdf_image_t *dt_pdf_add_image(dt_pdf_t *pdf,
   pdf_image->size = bytes_written;
 
   return pdf_image;
+}
+
+gboolean dt_pdf_add_image_to_list(dt_pdf_t *pdf,
+                                  GList **images,
+                                  const unsigned char *image,
+                                  const int width,
+                                  const int height,
+                                  const int bpp,
+                                  const int icc_id,
+                                  const float border)
+{
+  if(!images)
+  {
+    errno = EINVAL;
+    return FALSE;
+  }
+
+  dt_pdf_image_t *pdf_image = dt_pdf_add_image(pdf, image, width, height,
+                                                bpp, icc_id, border);
+  if(!pdf_image) return FALSE;
+
+  *images = g_list_append(*images, pdf_image);
+  return TRUE;
 }
 
 dt_pdf_page_t *dt_pdf_add_page(dt_pdf_t *pdf,
@@ -488,7 +583,12 @@ dt_pdf_page_t *dt_pdf_add_page(dt_pdf_t *pdf,
   size_t stream_size = 0, bytes_written = 0;
 
   // the page object
-  _pdf_set_offset(pdf, pdf_page->object_id, pdf->bytes_written + bytes_written);
+  if(!_pdf_set_offset(pdf, pdf_page->object_id,
+                      pdf->bytes_written + bytes_written))
+  {
+    free(pdf_page);
+    return NULL;
+  }
   bytes_written += fprintf(pdf->fd,
     "%d 0 obj\n"
     "<<\n"
@@ -512,7 +612,11 @@ dt_pdf_page_t *dt_pdf_add_page(dt_pdf_t *pdf,
   );
 
   // page content
-  _pdf_set_offset(pdf, content_id, pdf->bytes_written + bytes_written);
+  if(!_pdf_set_offset(pdf, content_id, pdf->bytes_written + bytes_written))
+  {
+    free(pdf_page);
+    return NULL;
+  }
   bytes_written += fprintf(pdf->fd,
     "%d 0 obj\n"
     "<<\n"
@@ -648,7 +752,11 @@ dt_pdf_page_t *dt_pdf_add_page(dt_pdf_t *pdf,
   bytes_written += stream_size;
 
   // length of the last stream
-  _pdf_set_offset(pdf, length_id, pdf->bytes_written + bytes_written);
+  if(!_pdf_set_offset(pdf, length_id, pdf->bytes_written + bytes_written))
+  {
+    free(pdf_page);
+    return NULL;
+  }
   bytes_written += fprintf(pdf->fd, "%d 0 obj\n"
                                     "%zu\n"
                                     "endobj\n",
@@ -663,15 +771,19 @@ dt_pdf_page_t *dt_pdf_add_page(dt_pdf_t *pdf,
 // our writing order is a little strange since we write object 2 (the
 // pages dictionary) at the end of the file because we don't know the
 // number of pages / objects in advance (due to lazy coding)
-void dt_pdf_finish(dt_pdf_t *pdf,
-                   dt_pdf_page_t **pages,
-                   const int n_pages)
+gboolean dt_pdf_finish(dt_pdf_t *pdf,
+                       dt_pdf_page_t **pages,
+                       const int n_pages)
 {
+  if(!pdf || !pdf->fd) return FALSE;
+  gboolean ok = FALSE;
+  if(pdf->failed) goto cleanup;
+
   const int info_id = pdf->next_id++;
   size_t bytes_written = 0;
 
   // the pages dictionary
-  _pdf_set_offset(pdf, 2, pdf->bytes_written + bytes_written);
+  if(!_pdf_set_offset(pdf, 2, pdf->bytes_written + bytes_written)) goto cleanup;
   bytes_written += fprintf(pdf->fd,
     "2 0 obj\n" // yes, this is hardcoded to be object 2, even if written in the end
     "<<\n"
@@ -743,7 +855,7 @@ void dt_pdf_finish(dt_pdf_t *pdf,
 
 time_error:
 
-  _pdf_set_offset(pdf, info_id, pdf->bytes_written + bytes_written);
+  if(!_pdf_set_offset(pdf, info_id, pdf->bytes_written + bytes_written)) goto cleanup;
   bytes_written += fprintf(pdf->fd,
     "%d 0 obj\n"
     "<<\n"
@@ -795,9 +907,30 @@ time_error:
                    "%%%%EOF\n",
           pdf->bytes_written);
 
-  fclose(pdf->fd);
+  ok = ferror(pdf->fd) == 0;
+  if(fflush(pdf->fd) != 0 || ferror(pdf->fd) != 0) ok = FALSE;
+
+cleanup:
+  if(fclose(pdf->fd) != 0) ok = FALSE;
   free(pdf->offsets);
   free(pdf);
+  return ok;
+}
+
+gboolean dt_pdf_finish_output(dt_pdf_t *pdf,
+                              dt_pdf_page_t **pages,
+                              const int n_pages,
+                              char **owned_filename)
+{
+  const gboolean finish_ok = dt_pdf_finish(pdf, pages, n_pages);
+  if(!finish_ok && owned_filename && *owned_filename)
+  {
+    if(g_unlink(*owned_filename) == 0 || errno == ENOENT)
+      g_clear_pointer(owned_filename, g_free);
+  }
+  else if(owned_filename)
+    g_clear_pointer(owned_filename, g_free);
+  return finish_ok;
 }
 
 #ifdef STANDALONE

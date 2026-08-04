@@ -905,25 +905,56 @@ if(USE_COLORD)
   endif(Colord_FOUND)
 endif(USE_COLORD)
 
+set(PRINT_BACKEND_ENABLED OFF)
+
 if(BUILD_PRINT)
-  find_package(Cups)
-  if(CUPS_FOUND)
-    include_directories(SYSTEM ${CUPS_INCLUDE_DIR})
-    FILE(GLOB SOURCE_FILES_PRINT
-      "common/cups_print.h"
-      "common/cups_print.c"
-      "common/printprof.c"
-      "common/printing.h"
-      "common/printing.c"
+  set(SOURCE_FILES_PRINT
+    "common/print_limits.h"
+    "common/print_backend.h"
+    "common/print_backend.c"
+    "common/print_backend_utils.h"
+    "common/print_backend_utils.c"
+    "common/printprof.c"
+    "common/printing.h"
+    "common/printing.c"
+    )
+
+  if(WIN32)
+    list(APPEND SOURCE_FILES_PRINT
+      "common/win_print.h"
+      "common/win_print.c"
+      "common/win_print_utils.h"
+      "common/win_print_utils.c"
       )
-    set(SOURCES ${SOURCES} ${SOURCE_FILES_PRINT})
-    list(APPEND LIBS ${CUPS_LIBRARIES})
+    list(APPEND LIBS gdi32 winspool)
     add_definitions("-DHAVE_PRINT")
-    message(STATUS "Print mode: enabled")
-  else(CUPS_FOUND)
-    set(BUILD_PRINT OFF)
-    message(STATUS "Print mode: disabled, please install CUPS dev package")
-  endif(CUPS_FOUND)
+    add_definitions("-DDT_PRINT_BACKEND_WINDOWS")
+    set(PRINT_BACKEND_ENABLED ON)
+    message(STATUS "Print mode: enabled, Windows GDI backend")
+  else(WIN32)
+    find_package(Cups)
+    if(CUPS_FOUND)
+      include_directories(SYSTEM ${CUPS_INCLUDE_DIR})
+      list(APPEND SOURCE_FILES_PRINT
+        "common/cups_print.h"
+        "common/cups_print.c"
+        "common/cups_print_utils.h"
+        "common/cups_print_utils.c"
+        )
+      list(APPEND LIBS ${CUPS_LIBRARIES})
+      add_definitions("-DHAVE_PRINT")
+      add_definitions("-DDT_PRINT_BACKEND_CUPS")
+      set(PRINT_BACKEND_ENABLED ON)
+      message(STATUS "Print mode: enabled, CUPS backend")
+    else(CUPS_FOUND)
+      set(BUILD_PRINT OFF)
+      message(STATUS "Print mode: disabled, please install CUPS dev package")
+    endif(CUPS_FOUND)
+  endif(WIN32)
+
+  if(PRINT_BACKEND_ENABLED)
+    set(SOURCES ${SOURCES} ${SOURCE_FILES_PRINT})
+  endif(PRINT_BACKEND_ENABLED)
 else(BUILD_PRINT)
   message(STATUS "Print mode: disabled")
 endif(BUILD_PRINT)

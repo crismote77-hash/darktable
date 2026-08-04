@@ -22,10 +22,10 @@ if(Gphoto2_FOUND)
     set(MODULES ${MODULES} tethering)
 endif(Gphoto2_FOUND)
 
-if(CUPS_FOUND)
+if(PRINT_BACKEND_ENABLED)
     add_library(print MODULE "print.c")
     set(MODULES ${MODULES} print)
-endif(CUPS_FOUND)
+endif(PRINT_BACKEND_ENABLED)
 
 foreach(module ${MODULES})
     target_link_libraries(${module} lib_darktable)

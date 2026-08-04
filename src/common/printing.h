@@ -21,7 +21,7 @@
 #include <glib.h>
 #include <inttypes.h>
 #include "common/pdf.h"
-#include "common/cups_print.h"
+#include "common/print_backend.h"
 #include "common/image.h"
 #include "common/math.h"
 
@@ -44,6 +44,7 @@ typedef struct _image_box
   dt_image_pos screen;           // current screen pos (in pixels)
   dt_image_pos print;            // current print pos (in pixels) depending on paper size + DPI
   uint16_t *buf;
+  GBytes *source_icc_blob;        // owned export profile for this image buffer
 } dt_image_box;
 
 typedef struct dt_screen_pos
@@ -75,8 +76,13 @@ int32_t dt_printing_get_image_box(const dt_images_box *imgs,
                                   const int x,
                                   const int y);
 
+/* Initialize fresh storage without inspecting or releasing its previous contents. */
+void dt_printing_init_boxes(dt_images_box *imgs);
+/* Owning resets; inputs must already be initialized. */
 void dt_printing_clear_box(dt_image_box *img);
 void dt_printing_clear_boxes(dt_images_box *imgs);
+void dt_printing_free_image_buffers(dt_images_box *imgs);
+gboolean dt_printing_remove_box(dt_images_box *imgs, int box_index);
 
 /* (x, y) -> (width, height) are in pixels (on screen position) */
 void dt_printing_setup_display(dt_images_box *imgs,

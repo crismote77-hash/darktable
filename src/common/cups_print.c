@@ -29,8 +29,10 @@
 #include "common/image_cache.h"
 #include "common/mipmap_cache.h"
 #include "common/pdf.h"
+#include "common/print_backend_utils.h"
 #include "control/jobs/control_jobs.h"
 #include "cups_print.h"
+#include "cups_print_utils.h"
 
 // enable weak linking in libcups on macOS
 #if defined(__APPLE__) && MAC_OS_X_VERSION_MIN_REQUIRED < MAC_OS_X_VERSION_10_8 && ((CUPS_VERSION_MAJOR == 1 && CUPS_VERSION_MINOR >= 6) || CUPS_VERSION_MAJOR > 1)
@@ -61,20 +63,8 @@ typedef struct dt_prtctl_t
   void *user_data;
 } dt_prtctl_t;
 
-// initialize the pinfo structure
-void dt_init_print_info(dt_print_info_t *pinfo)
-{
-  memset(&pinfo->printer, 0, sizeof(dt_printer_info_t));
-  memset(&pinfo->page, 0, sizeof(dt_page_setup_t));
-  memset(&pinfo->paper, 0, sizeof(dt_paper_info_t));
-  pinfo->printer.intent = DT_INTENT_PERCEPTUAL;
-  pinfo->printer.is_turboprint = FALSE;
-  *pinfo->printer.profile = '\0';
-  pinfo->num_printers = 0;
-}
-
-void dt_get_printer_info(const char *printer_name,
-                         dt_printer_info_t *pinfo)
+void dt_cups_get_printer_info(const char *printer_name,
+                              dt_printer_info_t *pinfo)
 {
   cups_dest_t *dests;
   const int num_dests = cupsGetDests(&dests);
@@ -159,7 +149,7 @@ static int _dest_cb(void *user_data,
   {
     dt_printer_info_t pr;
     memset(&pr, 0, sizeof(pr));
-    dt_get_printer_info(dest->name, &pr);
+    dt_cups_get_printer_info(dest->name, &pr);
     if(pctl->cb) pctl->cb(&pr, pctl->user_data);
     dt_print(DT_DEBUG_PRINT, "[print] new printer %s found", dest->name);
   }
@@ -196,20 +186,21 @@ static int _detect_printers_callback(dt_job_t *job)
     res=1;
   }
 #endif
-  darktable.control->cups_started = TRUE;
+  dt_printers_discovery_settled();
   return !res;
 }
 
-void dt_printers_abort_discovery(void)
+void dt_cups_printers_abort_discovery(void)
 {
   _cancel = 1;
 }
 
-void dt_printers_discovery(void (*cb)(dt_printer_info_t *pr, void *user_data),
-                           void *user_data)
+void dt_cups_printers_discovery(void (*cb)(dt_printer_info_t *pr, void *user_data),
+                                void *user_data)
 {
   // asynchronously checks for available printers
   dt_job_t *job = dt_control_job_create(&_detect_printers_callback, "detect connected printers");
+  _cancel = 0;
   if(job)
   {
     dt_prtctl_t *prtctl = g_malloc0(sizeof(dt_prtctl_t));
@@ -220,6 +211,8 @@ void dt_printers_discovery(void (*cb)(dt_printer_info_t *pr, void *user_data),
     dt_control_job_set_params(job, prtctl, g_free);
     dt_control_add_job(DT_JOB_QUEUE_SYSTEM_BG, job);
   }
+  else
+    dt_printers_discovery_settled();
 }
 
 static gboolean paper_exists(GList *papers,
@@ -237,23 +230,6 @@ static gboolean paper_exists(GList *papers,
   return FALSE;
 }
 
-dt_paper_info_t *dt_get_paper(GList *papers,
-                              const char *name)
-{
-  dt_paper_info_t *result = NULL;
-
-  for(GList *p = papers; p; p = g_list_next(p))
-  {
-    dt_paper_info_t *pi = (dt_paper_info_t*)p->data;
-    if(!strcmp(pi->name,name) || !strcmp(pi->common_name,name))
-    {
-      result = pi;
-      break;
-    }
-  }
-  return result;
-}
-
 static gint
 sort_papers (gconstpointer p1, gconstpointer p2)
 {
@@ -264,7 +240,7 @@ sort_papers (gconstpointer p1, gconstpointer p2)
   return l1==l2 ? strcmp(n1->common_name, n2->common_name) : (l1 < l2 ? -1 : +1);
 }
 
-GList *dt_get_papers(const dt_printer_info_t *printer)
+GList *dt_cups_get_papers(const dt_printer_info_t *printer)
 {
   const char *printer_name = printer->name;
   GList *result = NULL;
@@ -300,16 +276,17 @@ GList *dt_get_papers(const dt_printer_info_t *printer)
             if(size.width!=0 && size.length!=0 && !paper_exists(result, size.media))
             {
               pwg_media_t *med = pwgMediaForPWG (size.media);
-              char common_name[MAX_NAME] = { 0 };
-
-              if(med->ppd)
-                g_strlcpy(common_name, med->ppd, sizeof(common_name));
-              else
-                g_strlcpy(common_name, size.media, sizeof(common_name));
-
-              dt_paper_info_t *paper = malloc(sizeof(dt_paper_info_t));
-              g_strlcpy(paper->name, size.media, sizeof(paper->name));
-              g_strlcpy(paper->common_name, common_name, sizeof(paper->common_name));
+              const char *common_name = med && med->ppd ? med->ppd : size.media;
+              dt_paper_info_t *paper = calloc(1, sizeof(dt_paper_info_t));
+              if(!dt_print_store_name(paper->name, sizeof(paper->name), size.media)
+                 || !dt_print_store_name(paper->common_name,
+                                         sizeof(paper->common_name), common_name))
+              {
+                dt_print(DT_DEBUG_PRINT,
+                         "[print] rejected CUPS paper name outside the protocol bound");
+                free(paper);
+                continue;
+              }
               paper->width = (double)size.width / 100.0;
               paper->height = (double)size.length / 100.0;
               result = g_list_append (result, paper);
@@ -347,9 +324,17 @@ GList *dt_get_papers(const dt_printer_info_t *printer)
     {
       if(size->width!=0 && size->length!=0 && !paper_exists(result, size->name))
       {
-        dt_paper_info_t *paper = malloc(sizeof(dt_paper_info_t));
-        g_strlcpy(paper->name, size->name, MAX_NAME);
-        g_strlcpy(paper->common_name, size->name, MAX_NAME);
+        dt_paper_info_t *paper = calloc(1, sizeof(dt_paper_info_t));
+        if(!dt_print_store_name(paper->name, sizeof(paper->name), size->name)
+           || !dt_print_store_name(paper->common_name,
+                                   sizeof(paper->common_name), size->name))
+        {
+          dt_print(DT_DEBUG_PRINT,
+                   "[print] rejected PPD paper name outside the protocol bound");
+          free(paper);
+          size++;
+          continue;
+        }
         paper->width = (double)dt_pdf_point_to_mm(size->width);
         paper->height = (double)dt_pdf_point_to_mm(size->length);
         result = g_list_append (result, paper);
@@ -369,7 +354,7 @@ GList *dt_get_papers(const dt_printer_info_t *printer)
   return result;
 }
 
-GList *dt_get_media_type(const dt_printer_info_t *printer)
+GList *dt_cups_get_media_type(const dt_printer_info_t *printer)
 {
   const char *printer_name = printer->name;
   GList *result = NULL;
@@ -389,9 +374,17 @@ GList *dt_get_media_type(const dt_printer_info_t *printer)
 
         for(int k=0; k<opt->num_choices; k++)
         {
-          dt_medium_info_t *media = malloc(sizeof(dt_medium_info_t));
-          g_strlcpy(media->name, choice->choice, MAX_NAME);
-          g_strlcpy(media->common_name, choice->text, MAX_NAME);
+          dt_medium_info_t *media = calloc(1, sizeof(dt_medium_info_t));
+          if(!dt_print_store_name(media->name, sizeof(media->name), choice->choice)
+             || !dt_print_store_name(media->common_name,
+                                     sizeof(media->common_name), choice->text))
+          {
+            dt_print(DT_DEBUG_PRINT,
+                     "[print] rejected PPD media name outside the protocol bound");
+            free(media);
+            choice++;
+            continue;
+          }
           result = g_list_prepend (result, media);
 
           dt_print(DT_DEBUG_PRINT,
@@ -408,27 +401,71 @@ GList *dt_get_media_type(const dt_printer_info_t *printer)
   return g_list_reverse(result);  // list was built in reverse order, so un-reverse it
 }
 
-dt_medium_info_t *dt_get_medium(GList *media,
-                                const char *name)
+static gboolean _print_job_cancelled(dt_job_t *job)
 {
-  dt_medium_info_t *result = NULL;
-
-  for(GList *m = media; m; m = g_list_next(m))
-  {
-    dt_medium_info_t *mi = (dt_medium_info_t*)m->data;
-    if(!strcmp(mi->name, name) || !strcmp(mi->common_name, name))
-    {
-      result = mi;
-      break;
-    }
-  }
-  return result;
+  return job && dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED;
 }
 
-void dt_print_file(const dt_imgid_t imgid,
-                   const char *filename,
-                   const char *job_title,
-                   const dt_print_info_t *pinfo)
+static void _set_cancelled_error(GError **error, const char *printer_name)
+{
+  g_set_error(error, g_quark_from_static_string("dt-print-cups-error-quark"),
+              DT_CUPS_PRINT_ERROR_CANCELLED,
+              _("printing on `%s' cancelled"), printer_name ? printer_name : "");
+}
+
+dt_print_result_t dt_cups_print_submit(const dt_imgid_t imgid,
+                                       const char *job_title,
+                                       const dt_print_info_t *pinfo,
+                                       const dt_print_color_context_t *color,
+                                       dt_images_box *imgs,
+                                       dt_job_t *job,
+                                       GError **error)
+{
+  if(_print_job_cancelled(job))
+  {
+    _set_cancelled_error(error, pinfo->printer.name);
+    return DT_PRINT_RESULT_CANCELLED;
+  }
+
+  char pdf_filename[PATH_MAX] = { 0 };
+  dt_loc_get_tmp_dir(pdf_filename, sizeof(pdf_filename));
+  g_strlcat(pdf_filename, "/pf.XXXXXX", sizeof(pdf_filename));
+
+  const gint fd = g_mkstemp(pdf_filename);
+  if(fd == -1)
+  {
+    g_set_error(error, g_quark_from_static_string("dt-print-cups-error-quark"), 1,
+                _("failed to create temporary PDF for printing"));
+    return DT_PRINT_RESULT_FAILED;
+  }
+  if(close(fd) != 0)
+  {
+    g_set_error(error, g_quark_from_static_string("dt-print-cups-error-quark"), 1,
+                _("failed to close temporary PDF for printing"));
+    return dt_cups_cleanup_temporary_file(pdf_filename, DT_PRINT_RESULT_FAILED,
+                                          g_unlink, error);
+  }
+
+  dt_print_result_t result = dt_print_create_pdf(pdf_filename, pinfo, color, imgs, error)
+                               ? DT_PRINT_RESULT_SUCCESS : DT_PRINT_RESULT_FAILED;
+  if(result == DT_PRINT_RESULT_SUCCESS && _print_job_cancelled(job))
+  {
+    _set_cancelled_error(error, pinfo->printer.name);
+    result = DT_PRINT_RESULT_CANCELLED;
+  }
+  if(result == DT_PRINT_RESULT_SUCCESS)
+    result = dt_cups_print_file(imgid, pdf_filename, job_title, pinfo, color, job, error);
+
+  return dt_cups_cleanup_temporary_file(pdf_filename, result, g_unlink, error);
+}
+
+dt_print_result_t dt_cups_print_file(const dt_imgid_t imgid,
+                                     const char *filename,
+                                     const char *job_title,
+                                     const dt_print_info_t *pinfo,
+                                     const dt_print_color_context_t *color,
+                                     dt_job_t *job,
+                                     GError **error)
 {
   // first for safety check that filename exists and is readable
 
@@ -436,7 +473,10 @@ void dt_print_file(const dt_imgid_t imgid,
   {
     dt_control_log(_("file `%s' to print not found for image %d on `%s'"),
                    filename, imgid, pinfo->printer.name);
-    return;
+    g_set_error(error, g_quark_from_static_string("dt-print-cups-error-quark"), 1,
+                _("file `%s' to print not found for image %d on `%s'"),
+                filename, imgid, pinfo->printer.name);
+    return DT_PRINT_RESULT_FAILED;
   }
 
   cups_option_t *options = NULL;
@@ -459,9 +499,19 @@ void dt_print_file(const dt_imgid_t imgid,
     {
       dt_control_log(_("failed to create temporary file for printing options"));
       dt_print(DT_DEBUG_ALWAYS, "failed to create temporary PDF for printing options");
-      return;
+      g_set_error(error, g_quark_from_static_string("dt-print-cups-error-quark"), 1,
+                  _("failed to create temporary file for printing options"));
+      return DT_PRINT_RESULT_FAILED;
     }
-    close(fd);
+    if(close(fd) != 0)
+    {
+      g_set_error(error, g_quark_from_static_string("dt-print-cups-error-quark"), 1,
+                  _("failed to close temporary file for printing options"));
+      if(g_unlink(tmpfile) != 0)
+        dt_print(DT_DEBUG_PRINT,
+                 "[print] failed to remove temporary TurboPrint options file after close failure");
+      return DT_PRINT_RESULT_FAILED;
+    }
 
     // ensure that intent is in the range, may happen if at some point
     // we add new intent in the list
@@ -486,11 +536,10 @@ void dt_print_file(const dt_imgid_t imgid,
     argv[13] = g_strdup_printf("MediaType=%s", pinfo->medium.name);
     argv[14] = NULL;
 
-    gint exit_status = 0;
-
-    g_spawn_sync(NULL, argv, NULL,
-                 G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
-                 NULL, NULL, NULL, NULL, &exit_status, NULL);
+    GError *turboprint_error = NULL;
+    const gboolean turboprint_ok =
+      dt_cups_run_turboprint_options(tmpfile, argv, &num_options,
+                                     &options, &turboprint_error);
 
     g_free(argv[1]);
     g_free(argv[3]);
@@ -498,45 +547,35 @@ void dt_print_file(const dt_imgid_t imgid,
     g_free(argv[11]);
     g_free(argv[13]);
 
-    if(exit_status==0)
+    if(!turboprint_ok)
     {
-      FILE *stream = g_fopen(tmpfile, "rb");
-
-      while(1)
-      {
-        char optname[100];
-        char optvalue[100];
-        const int ropt = fscanf(stream, "%*s %99[^= ]=%99s", optname, optvalue);
-
-        // if we parsed an option name=value
-        if(ropt==2)
-        {
-          char *v = optvalue;
-
-          // remove possible single quote around value
-          if(*v == '\'') v++;
-          if(v[strlen(v)-1] == '\'') v[strlen(v)-1] = '\0';
-
-          num_options = cupsAddOption(optname, v, num_options, &options);
-        }
-        else if(ropt == EOF)
-          break;
-      }
-      fclose(stream);
-      g_unlink(tmpfile);
+      const char *detail = turboprint_error
+        ? turboprint_error->message : _("unknown TurboPrint error");
+      dt_control_log(_("TurboPrint failed for printer `%s': %s"),
+                     pinfo->printer.name, detail);
+      dt_print(DT_DEBUG_PRINT, "[print]   TurboPrint failed: %s", detail);
+      g_set_error(error, g_quark_from_static_string("dt-print-cups-error-quark"), 1,
+                  _("TurboPrint failed for printer `%s': %s"),
+                  pinfo->printer.name, detail);
+      g_clear_error(&turboprint_error);
+      return DT_PRINT_RESULT_FAILED;
     }
-    else
-    {
-      dt_control_log(_("printing on `%s' cancelled"), pinfo->printer.name);
-      dt_print(DT_DEBUG_PRINT, "[print]   command fails with %d, cancel printing", exit_status);
-      return;
-    }
+    g_clear_error(&turboprint_error);
   }
   else
   {
     cups_dest_t *dests;
     const int num_dests = cupsGetDests(&dests);
     cups_dest_t *dest = cupsGetDest(pinfo->printer.name, NULL, num_dests, dests);
+
+    if(!dest)
+    {
+      cupsFreeDests(num_dests, dests);
+      dt_control_log(_("printer `%s' is no longer available"), pinfo->printer.name);
+      g_set_error(error, g_quark_from_static_string("dt-print-cups-error-quark"), 1,
+                  _("printer `%s' is no longer available"), pinfo->printer.name);
+      return DT_PRINT_RESULT_FAILED;
+    }
 
     for(int j = 0; j < dest->num_options; j ++)
       if(cupsGetOption(dest->options[j].name, num_options,
@@ -547,35 +586,20 @@ void dt_print_file(const dt_imgid_t imgid,
 
     cupsFreeDests(num_dests, dests);
 
-    // When a printer ICC profile is selected, tell CUPS to skip its
-    // own color management — darktable already did the conversion
-    // via LittleCMS, and the ICC profile is embedded in the PDF.
-    //
-    // Linux: cm-calibration=true causes pdftoraster to set cm_disabled=1,
-    //        skipping its own color management.
-    //
-    // macOS: cgpdftoraster ignores cm-calibration. Instead we send
-    //        AP_ColorMatchingMode=AP_ApplicationColorMatching which
-    //        tells both cgpdftoraster and the printer driver that the
-    //        application already handled color matching.
+    // If darktable already converted to the printer profile, disable CUPS color management.
 
-    num_options = cupsAddOption("cm-calibration",
-                                *pinfo->printer.profile ? "true" : "false",
-                                num_options, &options);
+    const gboolean application_managed = color
+      && color->mode == DT_PRINT_COLOR_DARKTABLE_MANAGED
+      && color->printer_profile && *color->printer_profile;
 
 #ifdef __APPLE__
-    if(*pinfo->printer.profile)
-    {
-      // dot-notation variant appears to be legacy but is observed in
-      // print jobs from other macOS applications
-      num_options = cupsAddOption("AP.ColorMatchingMode",
-                                  "AP_ApplicationColorMatching",
-                                  num_options, &options);
-      num_options = cupsAddOption("AP_ColorMatchingMode",
-                                  "AP_ApplicationColorMatching",
-                                  num_options, &options);
-    }
+    const gboolean set_apple_color_matching = TRUE;
+#else
+    const gboolean set_apple_color_matching = FALSE;
 #endif
+    num_options = dt_cups_set_color_options(application_managed,
+                                            set_apple_color_matching,
+                                            num_options, &options);
 
     // media to print on
 
@@ -620,116 +644,63 @@ void dt_print_file(const dt_imgid_t imgid,
   for(int k=0; k<num_options; k++)
     dt_print(DT_DEBUG_PRINT, "[print]   %2d  %s=%s", k+1, options[k].name, options[k].value);
 
+  if(_print_job_cancelled(job))
+  {
+    dt_control_log(_("printing on `%s' cancelled"), pinfo->printer.name);
+    _set_cancelled_error(error, pinfo->printer.name);
+    cupsFreeOptions(num_options, options);
+    return DT_PRINT_RESULT_CANCELLED;
+  }
+
   const int job_id = cupsPrintFile(pinfo->printer.name, filename, job_title, num_options, options);
 
   if(job_id == 0)
+  {
     dt_control_log(_("error while printing `%s' on `%s'"), job_title, pinfo->printer.name);
-  else
-    dt_control_log(_("printing `%s' on `%s'"), job_title, pinfo->printer.name);
+    g_set_error(error, g_quark_from_static_string("dt-print-cups-error-quark"),
+                DT_CUPS_PRINT_ERROR_FAILED,
+                _("error while printing `%s' on `%s'"), job_title, pinfo->printer.name);
+    cupsFreeOptions(num_options, options);
+    return DT_PRINT_RESULT_FAILED;
+  }
+
+  const gboolean cancelled_after_submit = _print_job_cancelled(job);
+  ipp_status_t cancel_status = IPP_STATUS_OK;
+  const dt_cups_cancel_result_t cancel_result =
+    dt_cups_cancel_submitted_job(pinfo->printer.name, job_id,
+                                 cancelled_after_submit, cupsCancelJob2,
+                                 &cancel_status);
+
+  if(cancel_result != DT_CUPS_CANCEL_NOT_REQUESTED)
+  {
+    if(cancel_result == DT_CUPS_CANCEL_SUCCEEDED)
+    {
+      dt_control_log(_("printing on `%s' cancelled; CUPS job %d cancelled"),
+                     pinfo->printer.name, job_id);
+      g_set_error(error, g_quark_from_static_string("dt-print-cups-error-quark"),
+                  DT_CUPS_PRINT_ERROR_CANCELLED,
+                  _("printing on `%s' cancelled after submission; CUPS job %d cancelled"),
+                  pinfo->printer.name, job_id);
+    }
+    else
+    {
+      dt_control_log(_("printing on `%s' cancelled, but CUPS job %d cancellation failed"),
+                     pinfo->printer.name, job_id);
+      g_set_error(error, g_quark_from_static_string("dt-print-cups-error-quark"),
+                  DT_CUPS_PRINT_ERROR_CANCEL_FAILED,
+                  _("printing on `%s' cancelled, but CUPS job %d cancellation failed: %s"),
+                  pinfo->printer.name, job_id, ippErrorString(cancel_status));
+    }
+    cupsFreeOptions(num_options, options);
+    return cancel_result == DT_CUPS_CANCEL_SUCCEEDED
+             ? DT_PRINT_RESULT_CANCELLED : DT_PRINT_RESULT_FAILED;
+  }
+
+  dt_control_log(_("printing `%s' on `%s'"), job_title, pinfo->printer.name);
 
   cupsFreeOptions (num_options, options);
-}
 
-void dt_get_print_layout(const dt_print_info_t *prt,
-                         const int32_t area_width,
-                         const int32_t area_height,
-                         float *px,
-                         float *py,
-                         float *pwidth,
-                         float *pheight,
-                         float *ax,
-                         float *ay,
-                         float *awidth,
-                         float *aheight,
-                         gboolean *borderless)
-{
-  /* this is where the layout is done for the display and for the
-     print too. So this routine is one of the most critical for the
-     print circuitry. */
-
-  // page w/h
-  float pg_width  = prt->paper.width;
-  float pg_height = prt->paper.height;
-
-  /* here, width and height correspond to the area for the picture */
-
-  // non-printable
-  float np_top = prt->printer.hw_margin_top;
-  float np_left = prt->printer.hw_margin_left;
-  float np_right = prt->printer.hw_margin_right;
-  float np_bottom = prt->printer.hw_margin_bottom;
-
-  /* do some arrangements for the landscape mode. */
-
-  if(prt->page.landscape)
-  {
-    float tmp = pg_width;
-    pg_width = pg_height;
-    pg_height = tmp;
-
-    // rotate the non-printable margins
-    tmp       = np_top;
-    np_top    = np_right;
-    np_right  = np_bottom;
-    np_bottom = np_left;
-    np_left   = tmp;
-  }
-
-  // the image area aspect
-  const float a_aspect = (float)area_width / (float)area_height;
-
-  // page aspect
-  const float pg_aspect = pg_width / pg_height;
-
-  // display page
-  float p_bottom, p_right;
-
-  if(a_aspect > pg_aspect)
-  {
-    *px = (area_width - (area_height * pg_aspect)) / 2.0f;
-    *py = 0;
-    p_bottom = area_height;
-    p_right = area_width - *px;
-  }
-  else
-  {
-    *px = 0;
-    *py = (area_height - (area_width / pg_aspect)) / 2.0f;
-    p_right = area_width;
-    p_bottom = area_height - *py;
-  }
-
-  *pwidth = p_right - *px;
-  *pheight = p_bottom - *py;
-
-  // page margins, note that we do not want to change those values for
-  // the landscape mode.  these margins are those set by the user from
-  // the GUI, and the top margin is *always* at the top of the screen.
-
-  const float border_top = prt->page.margin_top;
-  const float border_left = prt->page.margin_left;
-  const float border_right = prt->page.margin_right;
-  const float border_bottom = prt->page.margin_bottom;
-
-  // display picture area, that is removing the non printable areas
-  // and user's margins
-
-  const float bx = *px + (border_left / pg_width) * (*pwidth);
-  const float by = *py + (border_top / pg_height) * (*pheight);
-  const float bb = p_bottom - (border_bottom / pg_height) * (*pheight);
-  const float br = p_right - (border_right / pg_width) * (*pwidth);
-
-  *borderless = border_left   < np_left
-             || border_right  < np_right
-             || border_top    < np_top
-             || border_bottom < np_bottom;
-
-  // now we have the printable area (ax, ay) -> (ax + awidth, ay + aheight)
-
-  *ax      = bx;
-  *ay      = by;
-  *awidth  = br - bx;
-  *aheight = bb - by;
+  return DT_PRINT_RESULT_SUCCESS;
 }
 
 // clang-format off

@@ -21,10 +21,10 @@
 #include "bauhaus/bauhaus.h"
 #include "common/collection.h"
 #include "common/colorspaces.h"
-#include "common/cups_print.h"
+#include "common/print_backend.h"
+#include "common/print_backend_utils.h"
 #include "common/image_cache.h"
 #include "common/metadata.h"
-#include "common/pdf.h"
 #include "common/printprof.h"
 #include "common/printing.h"
 #include "common/styles.h"
@@ -120,8 +120,9 @@ typedef struct dt_lib_print_settings_t
   float click_pos_x, click_pos_y;
   gboolean has_changed;
 
-  GList *printer_list;
-  dt_pthread_mutex_t printer_list_mutex;
+  GList *displayed_printer_names;
+  char *preferred_printer_name;
+  guint printer_refresh_source;
 } dt_lib_print_settings_t;
 
 typedef struct dt_lib_print_job_t
@@ -135,8 +136,6 @@ typedef struct dt_lib_print_job_t
   dt_iop_color_intent_t buf_icc_intent, p_icc_intent;
   dt_images_box imgs;
   uint16_t *buf; // ??? should be removed
-  dt_pdf_page_t *pdf_page;
-  char pdf_filename[PATH_MAX];
 } dt_lib_print_job_t;
 
 typedef struct dt_lib_export_profile_t
@@ -309,8 +308,20 @@ static int write_image(dt_imageio_module_data_t *data,
 {
   dt_print_format_t *d = (dt_print_format_t *)data;
 
-  d->params->buf =
-    (uint16_t *)malloc((size_t)3 * (d->bpp == 8?1:2) * d->head.width * d->head.height);
+  const gsize bytes_per_channel = d->bpp == 8 ? 1 : 2;
+  if(d->head.width <= 0 || d->head.height <= 0
+     || (gsize)d->head.width > G_MAXSIZE / 3 / bytes_per_channel
+     || (gsize)d->head.height
+          > G_MAXSIZE / ((gsize)3 * bytes_per_channel * d->head.width))
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[print] invalid image buffer geometry %d x %d",
+             d->head.width, d->head.height);
+    return 1;
+  }
+
+  const gsize buffer_size =
+    (gsize)3 * bytes_per_channel * d->head.width * d->head.height;
+  d->params->buf = (uint16_t *)malloc(buffer_size);
   if(!d->params->buf)
   {
     dt_print(DT_DEBUG_ALWAYS, "[print] unable to allocate memory for image %s", filename);
@@ -374,11 +385,19 @@ static int _export_image(dt_job_t *job, dt_image_box *img)
   const gboolean is_scaling = FALSE;
   const double scale_factor = 1.0;
 
-  dt_imageio_export_with_flags
+  const gboolean export_failed = dt_imageio_export_with_flags
     (img->imgid, "unused", &buf, (dt_imageio_module_data_t *)&dat, TRUE, FALSE,
      high_quality, upscale, is_scaling, scale_factor, FALSE, NULL,
      FALSE, export_masks, params->buf_icc_type,
      params->buf_icc_profile, params->buf_icc_intent,  NULL, NULL, 1, 1, NULL, -1);
+
+  if(export_failed || !params->buf || dat.head.width <= 0 || dat.head.height <= 0)
+  {
+    dt_control_log(_("error exporting image %d for printing"), img->imgid);
+    dt_print(DT_DEBUG_ALWAYS, "[print] invalid export for image %d (%d x %d)",
+             img->imgid, dat.head.width, dat.head.height);
+    return 1;
+  }
 
   img->exp_width = dat.head.width;
   img->exp_height = dat.head.height;
@@ -389,6 +408,35 @@ static int _export_image(dt_job_t *job, dt_image_box *img)
     dt_colorspaces_get_output_profile(img->imgid,
                                       params->buf_icc_type,
                                       params->buf_icc_profile);
+
+#if defined(DT_PRINT_BACKEND_WINDOWS) || defined(__APPLE__)
+  if(!*params->p_icc_profile)
+  {
+    if(!buf_profile || !buf_profile->profile)
+    {
+      dt_control_log(_("error getting output profile for image %d"), img->imgid);
+      return 1;
+    }
+
+    cmsUInt32Number profile_len = 0;
+    if(!cmsSaveProfileToMem(buf_profile->profile, NULL, &profile_len) || profile_len == 0)
+    {
+      dt_control_log(_("error serializing output profile for image %d"), img->imgid);
+      return 1;
+    }
+
+    void *profile_data = g_try_malloc(profile_len);
+    if(!profile_data
+       || !cmsSaveProfileToMem(buf_profile->profile, profile_data, &profile_len))
+    {
+      g_free(profile_data);
+      dt_control_log(_("error serializing output profile for image %d"), img->imgid);
+      return 1;
+    }
+    img->source_icc_blob = g_bytes_new_take(profile_data, profile_len);
+  }
+#endif
+
   if(*params->p_icc_profile)
   {
     const dt_colorspaces_color_profile_t *pprof =
@@ -436,70 +484,7 @@ static int _export_image(dt_job_t *job, dt_image_box *img)
   return 0;
 }
 
-static void _create_pdf(dt_job_t *job,
-                        dt_images_box imgs,
-                        const float width,
-                        const float height)
-{
-  dt_lib_print_job_t *params = dt_control_job_get_params(job);
 
-  const float page_width  = dt_pdf_mm_to_point(width);
-  const float page_height = dt_pdf_mm_to_point(height);
-  int icc_id = 0;
-
-  dt_pdf_image_t *pdf_image[MAX_IMAGE_PER_PAGE];
-
-  // create the PDF page
-  dt_pdf_t *pdf = dt_pdf_start(params->pdf_filename, page_width, page_height,
-                               params->prt.printer.resolution,
-                               DT_PDF_STREAM_ENCODER_FLATE);
-
-#ifdef __APPLE__
-  // On macOS, embed the printer ICC profile in the PDF so the
-  // already-converted pixel data is correctly tagged with its actual
-  // color space. Without this, cgpdftoraster assumes DeviceRGB = sRGB
-  // and misinterprets the data.
-  //
-  // On Linux this must NOT be done — Poppler (inside pdftoraster) would
-  // see the ICCBased color space and convert the data back to sRGB,
-  // undoing the LittleCMS conversion. Linux uses cm-calibration instead.
-  if(params->p_icc_profile && *params->p_icc_profile)
-    icc_id = dt_pdf_add_icc(pdf, params->p_icc_profile);
-#endif
-
-  int32_t count = 0;
-
-  for(int k=0; k<imgs.count; k++)
-  {
-    const int resolution = params->prt.printer.resolution;
-    const dt_image_box *box = &imgs.box[k];
-
-    if(dt_is_valid_imgid(box->imgid))
-    {
-      pdf_image[count] =
-        dt_pdf_add_image(pdf, (uint8_t *)box->buf, box->exp_width, box->exp_height,
-                         8, icc_id, 0.0);
-
-      //  PDF bounding-box has origin on bottom-left
-      pdf_image[count]->bb_x      = dt_pdf_pixel_to_point(box->print.x, resolution);
-      pdf_image[count]->bb_y      = dt_pdf_pixel_to_point(box->print.y, resolution);
-      pdf_image[count]->bb_width  = dt_pdf_pixel_to_point(box->print.width, resolution);
-      pdf_image[count]->bb_height = dt_pdf_pixel_to_point(box->print.height, resolution);
-      count++;
-    }
-  }
-
-  params->pdf_page = dt_pdf_add_page(pdf, pdf_image, count);
-  dt_pdf_finish(pdf, &params->pdf_page, 1);
-
-  // now releases all the buf
-  for(int k=0; k<imgs.count; k++)
-  {
-    dt_image_box *box = &imgs.box[k];
-    g_free(box->buf);
-    box->buf = NULL;
-  }
-}
 
 void _fill_box_values(dt_lib_print_settings_t *ps)
 {
@@ -585,37 +570,64 @@ static int _print_job_run(dt_job_t *job)
     return 0;
   dt_control_job_set_progress(job, 0.9);
 
-  dt_loc_get_tmp_dir(params->pdf_filename, sizeof(params->pdf_filename));
-  g_strlcat(params->pdf_filename, "/pf.XXXXXX.pdf", sizeof(params->pdf_filename));
-
-  const gint fd = g_mkstemp(params->pdf_filename);
-  if(fd == -1)
+  const dt_print_color_context_t color =
   {
-    dt_control_log(_("failed to create temporary PDF for printing"));
-    dt_print(DT_DEBUG_ALWAYS, "failed to create temporary PDF for printing");
+    .mode = *params->p_icc_profile
+              ? DT_PRINT_COLOR_DARKTABLE_MANAGED
+              : DT_PRINT_COLOR_DRIVER_MANAGED,
+    .printer_profile = *params->p_icc_profile ? params->p_icc_profile : NULL
+  };
+
+  GError *error = NULL;
+  const dt_print_result_t backend_result =
+    dt_print_submit(imgid, params->job_title, &params->prt, &color,
+                    &params->imgs, job, &error);
+  const gboolean cancelled_after_backend =
+    dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED;
+  const dt_print_result_t result =
+    dt_print_result_after_backend(backend_result, cancelled_after_backend);
+  if(result != DT_PRINT_RESULT_SUCCESS)
+  {
+    if(backend_result == DT_PRINT_RESULT_SUCCESS && cancelled_after_backend)
+    {
+      dt_control_log(
+        _("the print backend accepted the job before cancellation was observed; "
+          "submission is uncertain and the job may still print"));
+      g_clear_error(&error);
+      return 1;
+    }
+    if(!dt_print_result_is_failure(result))
+    {
+      g_clear_error(&error);
+      return 0;
+    }
+    dt_control_log("%s", error ? error->message : _("error while printing"));
+    g_clear_error(&error);
     return 1;
   }
-  close(fd);
 
-  float width, height;
-  _get_page_dimension(&params->prt, &width, &height);
+  const gboolean cancelled_before_metadata =
+    dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED;
+  const dt_print_result_t metadata_result =
+    dt_print_result_before_metadata(result, cancelled_before_metadata);
+  if(!dt_print_result_allows_metadata(metadata_result))
+  {
+    if(result == DT_PRINT_RESULT_SUCCESS && cancelled_before_metadata)
+      dt_control_log(
+        _("the print backend accepted the job before cancellation was observed; "
+          "submission is uncertain and the job may still print"));
+    g_clear_error(&error);
+    return 1;
+  }
 
-  _create_pdf(job, params->imgs, width, height);
-
-  if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) return 0;
-  dt_control_job_set_progress(job, 0.95);
-
-  // send to CUPS
-
-  dt_print_file(imgid, params->pdf_filename, params->job_title, &params->prt);
   dt_control_job_set_progress(job, 1.0);
 
   // add tag for this image
 
-  char tag[256] = { 0 };
+  char *tag = g_strdup_printf("darktable|printed|%s", params->prt.printer.name);
   guint tagid = 0;
-  snprintf (tag, sizeof(tag), "darktable|printed|%s", params->prt.printer.name);
   dt_tag_new(tag, &tagid);
+  g_free(tag);
 
   for(int k=0; k < params->imgs.count; k++)
   {
@@ -661,16 +673,10 @@ static void _page_delete_area(const dt_lib_module_t *self,
 {
   dt_lib_print_settings_t *ps = self->data;
 
-  if(box_index == -1) return;
+  if(!dt_printing_remove_box(&ps->imgs, box_index)) return;
 
-  for(int k=box_index; k<MAX_IMAGE_PER_PAGE-1; k++)
-  {
-    memcpy(&ps->imgs.box[k], &ps->imgs.box[k+1], sizeof(dt_image_box));
-  }
   ps->last_selected = -1;
   ps->selected = -1;
-  dt_printing_clear_box(&ps->imgs.box[MAX_IMAGE_PER_PAGE-1]);
-  ps->imgs.count--;
 
   if(ps->imgs.count > 0)
     ps->selected = 0;
@@ -693,8 +699,7 @@ static void _page_delete_area_clicked(GtkWidget *widget, dt_lib_module_t *self)
 static void _print_job_cleanup(void *p)
 {
   dt_lib_print_job_t *params = p;
-  if(params->pdf_filename[0]) g_unlink(params->pdf_filename);
-  free(params->pdf_page);
+  dt_printing_free_image_buffers(&params->imgs);
   free(params->buf);
   g_free(params->style);
   g_free(params->buf_icc_profile);
@@ -787,13 +792,6 @@ static void _print_button_clicked(GtkWidget *widget, dt_lib_module_t *self)
   params->p_icc_intent = ps->v_pintent;
   params->black_point_compensation = ps->v_black_point_compensation;
 
-  // Propagate the printer profile selection so dt_print_file() can
-  // tell CUPS to skip color management when dt already did the
-  // ICC conversion. See cups_print.c for platform-specific details.
-  if(ps->v_piccprofile && *ps->v_piccprofile)
-    g_strlcpy(params->prt.printer.profile, ps->v_piccprofile,
-              sizeof(params->prt.printer.profile));
-
   dt_control_add_job(DT_JOB_QUEUE_USER_EXPORT, job);
 }
 
@@ -821,8 +819,8 @@ static void _set_printer(const dt_lib_module_t *self,
     dt_bauhaus_combobox_add(ps->papers, p->common_name);
   }
   const char *default_paper = dt_conf_get_string_const(PRINT_CONFIG_PREFIX "paper");
-  if(!dt_bauhaus_combobox_set_from_text(ps->papers, default_paper))
-    dt_bauhaus_combobox_set(ps->papers, 0);
+  const int paper_index = dt_print_paper_index(ps->paper_list, default_paper);
+  dt_bauhaus_combobox_set(ps->papers, paper_index >= 0 ? paper_index : 0);
 
   // add corresponding supported media
   dt_bauhaus_combobox_clear(ps->media);
@@ -834,8 +832,8 @@ static void _set_printer(const dt_lib_module_t *self,
     dt_bauhaus_combobox_add(ps->media, m->common_name);
   }
   const char *default_medium = dt_conf_get_string_const(PRINT_CONFIG_PREFIX "medium");
-  if(!dt_bauhaus_combobox_set_from_text(ps->media, default_medium))
-    dt_bauhaus_combobox_set(ps->media, 0);
+  const int medium_index = dt_print_medium_index(ps->media_list, default_medium);
+  dt_bauhaus_combobox_set(ps->media, medium_index >= 0 ? medium_index : 0);
 
   dt_view_print_settings(darktable.view_manager, &ps->prt, &ps->imgs);
 }
@@ -854,21 +852,18 @@ _paper_changed(GtkWidget *combo, const dt_lib_module_t *self)
 {
   dt_lib_print_settings_t *ps = self->data;
 
-  const gchar *paper_name = dt_bauhaus_combobox_get_text(combo);
+  const int paper_index = dt_bauhaus_combobox_get(combo);
+  const dt_paper_info_t *paper = dt_print_paper_at(ps->paper_list, paper_index);
+  if(!paper) return;
 
-  if(!paper_name) return;
-
-  const dt_paper_info_t *paper = dt_get_paper(ps->paper_list, paper_name);
-
-  if(paper)
-    memcpy(&ps->prt.paper, paper, sizeof(dt_paper_info_t));
+  memcpy(&ps->prt.paper, paper, sizeof(dt_paper_info_t));
 
   float width, height;
   _get_page_dimension(&ps->prt, &width, &height);
 
   dt_printing_setup_page(&ps->imgs, width, height, ps->prt.printer.resolution);
 
-  dt_conf_set_string(PRINT_CONFIG_PREFIX "paper", paper_name);
+  dt_conf_set_string(PRINT_CONFIG_PREFIX "paper", paper->name);
   dt_view_print_settings(darktable.view_manager, &ps->prt, &ps->imgs);
 
   _update_slider(ps);
@@ -879,16 +874,13 @@ _media_changed(GtkWidget *combo, const dt_lib_module_t *self)
 {
   dt_lib_print_settings_t *ps = self->data;
 
-  const gchar *medium_name = dt_bauhaus_combobox_get_text(combo);
+  const int medium_index = dt_bauhaus_combobox_get(combo);
+  const dt_medium_info_t *medium = dt_print_medium_at(ps->media_list, medium_index);
+  if(!medium) return;
 
-  if(!medium_name) return;
+  memcpy(&ps->prt.medium, medium, sizeof(dt_medium_info_t));
 
-  const dt_medium_info_t *medium = dt_get_medium(ps->media_list, medium_name);
-
-  if(medium)
-    memcpy(&ps->prt.medium, medium, sizeof(dt_medium_info_t));
-
-  dt_conf_set_string(PRINT_CONFIG_PREFIX "medium", medium_name);
+  dt_conf_set_string(PRINT_CONFIG_PREFIX "medium", medium->name);
   dt_view_print_settings(darktable.view_manager, &ps->prt, &ps->imgs);
 
   _update_slider(ps);
@@ -1461,51 +1453,115 @@ static GList* _get_profiles()
   return g_list_reverse(list);  // list was built in reverse order, so un-reverse it
 }
 
-static void _new_printer_callback(dt_printer_info_t *printer,
-                                  void *user_data)
+G_LOCK_DEFINE_STATIC(printer_discovery);
+static GList *_discovered_printer_names = NULL;
+static dt_print_printer_refresh_state_t _printer_refresh_state = { 0 };
+
+static void _new_printer_callback(dt_printer_info_t *printer, void *user_data)
 {
-  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
-  dt_lib_print_settings_t *d = (dt_lib_print_settings_t*)self->data;
+  (void)user_data;
+  if(!printer || !*printer->name) return;
 
-  dt_pthread_mutex_lock(&d->printer_list_mutex);
-  d->printer_list = g_list_append(d->printer_list, g_strdup(printer->name));
-  dt_pthread_mutex_unlock(&d->printer_list_mutex);
+  G_LOCK(printer_discovery);
+  if(!g_list_find_custom(_discovered_printer_names, printer->name,
+                         (GCompareFunc)g_strcmp0))
+    _discovered_printer_names = g_list_append(_discovered_printer_names,
+                                              g_strdup(printer->name));
+  G_UNLOCK(printer_discovery);
+}
 
-  d->prt.num_printers++;
+static gpointer _copy_printer_name(gconstpointer source, gpointer user_data)
+{
+  (void)user_data;
+  return g_strdup(source);
+}
+
+static void _refresh_printer_combo(dt_lib_module_t *self,
+                                   const gboolean discovery_settled)
+{
+  dt_lib_print_settings_t *d = self->data;
+  GList *discovered_names = NULL;
+  G_LOCK(printer_discovery);
+  discovered_names = g_list_copy_deep(_discovered_printer_names,
+                                      _copy_printer_name, NULL);
+  G_UNLOCK(printer_discovery);
+
+  GList *added_names = dt_print_printer_names_merge_new(
+    &d->displayed_printer_names, discovered_names);
+
+  g_signal_handlers_block_by_func(G_OBJECT(d->printers),
+                                  G_CALLBACK(_printer_changed), self);
+  for(const GList *iter = added_names; iter; iter = g_list_next(iter))
+    dt_bauhaus_combobox_add(d->printers, iter->data);
+
+  const char *printer_to_select = dt_print_printer_name_to_select(
+    d->displayed_printer_names, d->prt.printer.name,
+    d->preferred_printer_name, discovery_settled);
+  if(printer_to_select)
+    dt_bauhaus_combobox_set_from_text(d->printers, printer_to_select);
+  else if(!*d->prt.printer.name)
+    dt_bauhaus_combobox_set(d->printers, -1);
+  g_signal_handlers_unblock_by_func(G_OBJECT(d->printers),
+                                    G_CALLBACK(_printer_changed), self);
+
+  if(printer_to_select
+     && g_strcmp0(d->prt.printer.name, printer_to_select))
+    _set_printer(self, printer_to_select);
+
+  d->prt.num_printers = g_list_length(d->displayed_printer_names);
+  g_list_free(added_names);
+  g_list_free_full(discovered_names, g_free);
+}
+
+static guint _reduce_printer_refresh(
+  const dt_print_printer_refresh_event_t event,
+  const gboolean discovery_settled)
+{
+  G_LOCK(printer_discovery);
+  const guint actions = dt_print_printer_refresh_reduce(
+    &_printer_refresh_state, event, discovery_settled);
+  if(actions & DT_PRINT_PRINTER_REFRESH_START_DISCOVERY)
+  {
+    g_list_free_full(_discovered_printer_names, g_free);
+    _discovered_printer_names = NULL;
+  }
+  G_UNLOCK(printer_discovery);
+  return actions;
+}
+
+static void _start_printer_discovery(const guint actions)
+{
+  if(actions & DT_PRINT_PRINTER_REFRESH_START_DISCOVERY)
+    dt_printers_discovery(_new_printer_callback, NULL);
+}
+
+static gboolean _refresh_printers_until_settled(gpointer user_data)
+{
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *d = self ? self->data : NULL;
+  if(!d) return G_SOURCE_REMOVE;
+
+  // Observe settled first. If the worker appended after the previous tick's
+  // cache copy, this settled tick is the required final main-thread drain.
+  const gboolean discovery_settled = dt_printers_discovery_is_settled();
+  const guint actions = _reduce_printer_refresh(
+    DT_PRINT_PRINTER_REFRESH_TICK, discovery_settled);
+
+  if(actions & DT_PRINT_PRINTER_REFRESH_DRAIN_CACHE)
+    _refresh_printer_combo(self, discovery_settled);
+  _start_printer_discovery(actions);
+
+  if(actions & DT_PRINT_PRINTER_REFRESH_KEEP_TIMER)
+    return G_SOURCE_CONTINUE;
+
+  d->printer_refresh_source = 0;
+  return G_SOURCE_REMOVE;
 }
 
 void view_enter(struct dt_lib_module_t *self,
                 struct dt_view_t *old_view,
                 struct dt_view_t *new_view)
 {
-  dt_lib_print_settings_t *d = (dt_lib_print_settings_t*)self->data;
-
-  dt_pthread_mutex_lock(&d->printer_list_mutex);
-  if(d->printer_list != NULL)
-  {
-    // The printer list was filled by dt_printers_discovery() in a background job.
-    // Now we fill the printer combo with the found printers.
-    char *default_printer = dt_conf_get_string(PRINT_CONFIG_PREFIX "printer");
-
-    for(const GList *iter = d->printer_list; iter; iter = g_list_next(iter))
-    {
-      const gchar *printer_name = iter->data;
-      dt_bauhaus_combobox_add(d->printers, printer_name);
-    }
-
-    if(default_printer[0] == '\0'
-       || !dt_bauhaus_combobox_set_from_text(d->printers, default_printer))
-    {
-      // no default printer or default printer not found
-      dt_bauhaus_combobox_set(d->printers, 0);
-    }
-
-    g_free(default_printer);
-    g_list_free_full(d->printer_list, g_free);
-    d->printer_list = NULL;
-  }
-  dt_pthread_mutex_unlock(&d->printer_list_mutex);
-
   // user activated a new image via the filmstrip or user entered view
   // mode which activates an image: get image_id and orientation
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_VIEWMANAGER_THUMBTABLE_ACTIVATE, _print_settings_activate_callback);
@@ -2414,23 +2470,21 @@ void gui_init(dt_lib_module_t *self)
   d->last_selected = -1;
   d->has_changed = FALSE;
 
-  d->printer_list = NULL;
-  dt_pthread_mutex_init(&d->printer_list_mutex, NULL);
+  d->displayed_printer_names = NULL;
+  d->preferred_printer_name = dt_conf_get_string(PRINT_CONFIG_PREFIX "printer");
+  d->printer_refresh_source = 0;
 
   dt_init_print_info(&d->prt);
+  dt_printing_init_boxes(&d->imgs);
   dt_view_print_settings(darktable.view_manager, &d->prt, &d->imgs);
 
   d->profiles = _get_profiles();
-
-  d->imgs.motion_over = -1;
 
   const char *str = dt_conf_get_string_const(PRINT_CONFIG_PREFIX "unit");
   const char **names = _unit_names;
   for(_unit_t i=0; *names; names++, i++)
     if(g_strcmp0(str, *names) == 0)
       d->unit = i;
-
-  dt_printing_clear_boxes(&d->imgs);
 
   // set all margins + unit from settings
 
@@ -2972,9 +3026,14 @@ void gui_init(dt_lib_module_t *self)
   gtk_box_pack_start(GTK_BOX(self->widget), button, TRUE, TRUE, 0);
   dt_gui_add_help_link(button, "print_settings_button");
 
-  // Let's start the printer discovery now
-
-  dt_printers_discovery(_new_printer_callback, self);
+  // The worker only writes the process-lifetime discovery cache. GTK is
+  // updated by the main-thread timeout while this module remains alive.
+  d->printer_refresh_source = g_timeout_add(50,
+                                            _refresh_printers_until_settled,
+                                            self);
+  const guint refresh_actions = _reduce_printer_refresh(
+    DT_PRINT_PRINTER_REFRESH_INIT, dt_printers_discovery_is_settled());
+  _start_printer_discovery(refresh_actions);
 }
 
 void *legacy_params(dt_lib_module_t *self,
@@ -3277,10 +3336,16 @@ int set_params(dt_lib_module_t *self,
     dt_bauhaus_combobox_set_from_text(ps->printers, printer);
 
   if(paper[0] != '\0')
-    dt_bauhaus_combobox_set_from_text(ps->papers, paper);
+  {
+    const int paper_index = dt_print_paper_index(ps->paper_list, paper);
+    if(paper_index >= 0) dt_bauhaus_combobox_set(ps->papers, paper_index);
+  }
 
   if(media[0] != '\0')
-    dt_bauhaus_combobox_set_from_text(ps->media, media);
+  {
+    const int medium_index = dt_print_medium_index(ps->media_list, media);
+    if(medium_index >= 0) dt_bauhaus_combobox_set(ps->media, medium_index);
+  }
 
   dt_bauhaus_combobox_set (ps->orientation, landscape);
 
@@ -3335,8 +3400,8 @@ void *get_params(dt_lib_module_t *self, int *size)
 
   // get the data
   const char *printer = dt_bauhaus_combobox_get_text(ps->printers);
-  const char *paper = dt_bauhaus_combobox_get_text(ps->papers);
-  const char *media = dt_bauhaus_combobox_get_text(ps->media);
+  const char *paper = ps->prt.paper.name;
+  const char *media = ps->prt.medium.name;
   const int32_t profile_pos = dt_bauhaus_combobox_get(ps->profile);
   const int32_t intent =  dt_bauhaus_combobox_get(ps->intent);
   const char *style = gtk_label_get_text(GTK_LABEL(ps->style));
@@ -3458,6 +3523,18 @@ void gui_cleanup(dt_lib_module_t *self)
 {
   dt_lib_print_settings_t *ps = self->data;
 
+  if(ps->printer_refresh_source)
+  {
+    g_source_remove(ps->printer_refresh_source);
+    ps->printer_refresh_source = 0;
+  }
+
+  const guint refresh_actions = _reduce_printer_refresh(
+    DT_PRINT_PRINTER_REFRESH_CLEANUP,
+    dt_printers_discovery_is_settled());
+  if(refresh_actions & DT_PRINT_PRINTER_REFRESH_ABORT_DISCOVERY)
+    dt_printers_abort_discovery();
+
   // these can be called on shutdown, resulting in null-pointer
   // dereference and division by zero -- not sure what interaction
   // makes them called, but better to disconnect and not have segfault
@@ -3473,6 +3550,16 @@ void gui_cleanup(dt_lib_module_t *self)
   g_list_free_full(ps->profiles, g_free);
   g_list_free_full(ps->paper_list, free);
   g_list_free_full(ps->media_list, free);
+  g_list_free_full(ps->displayed_printer_names, g_free);
+  g_free(ps->preferred_printer_name);
+
+  G_LOCK(printer_discovery);
+  if(!_printer_refresh_state.discovery_active)
+  {
+    g_list_free_full(_discovered_printer_names, g_free);
+    _discovered_printer_names = NULL;
+  }
+  G_UNLOCK(printer_discovery);
 
   g_free(ps->v_iccprofile);
   g_free(ps->v_piccprofile);

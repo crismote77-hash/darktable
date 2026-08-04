@@ -23,7 +23,7 @@ void _clear_pos(dt_image_pos *pos)
   pos->x = pos->y = pos->width = pos->height = 0.0f;
 }
 
-void dt_printing_clear_box(dt_image_box *img)
+static void _reset_box(dt_image_box *img)
 {
   img->imgid = NO_IMGID;
   img->max_width = img->max_height = 0;
@@ -32,17 +32,15 @@ void dt_printing_clear_box(dt_image_box *img)
   img->img_width = img->img_height = 0;
   img->alignment = ALIGNMENT_CENTER;
   img->buf = NULL;
+  img->source_icc_blob = NULL;
 
   _clear_pos(&img->screen);
   _clear_pos(&img->pos);
   _clear_pos(&img->print);
 }
 
-void dt_printing_clear_boxes(dt_images_box *imgs)
+static void _reset_boxes(dt_images_box *imgs)
 {
-  for(int k=0; k<MAX_IMAGE_PER_PAGE; k++)
-    dt_printing_clear_box(&imgs->box[k]);
-
   _clear_pos(&imgs->screen.page);
   _clear_pos(&imgs->screen.print_area);
 
@@ -50,7 +48,65 @@ void dt_printing_clear_boxes(dt_images_box *imgs)
   imgs->motion_over = -1;
   imgs->page_width = imgs->page_height = 0;
   imgs->page_width_mm = imgs->page_height_mm = 0;
-  imgs->imgid_to_load = -1;
+  imgs->imgid_to_load = NO_IMGID;
+}
+
+void dt_printing_init_boxes(dt_images_box *imgs)
+{
+  if(!imgs) return;
+
+  memset(imgs, 0, sizeof(*imgs));
+  for(int k = 0; k < MAX_IMAGE_PER_PAGE; k++)
+    _reset_box(&imgs->box[k]);
+  _reset_boxes(imgs);
+}
+
+void dt_printing_clear_box(dt_image_box *img)
+{
+  if(!img) return;
+
+  free(img->buf);
+  g_clear_pointer(&img->source_icc_blob, g_bytes_unref);
+  _reset_box(img);
+}
+
+void dt_printing_clear_boxes(dt_images_box *imgs)
+{
+  for(int k=0; k<MAX_IMAGE_PER_PAGE; k++)
+    dt_printing_clear_box(&imgs->box[k]);
+  _reset_boxes(imgs);
+}
+
+void dt_printing_free_image_buffers(dt_images_box *imgs)
+{
+  if(!imgs) return;
+
+  for(int k = 0; k < imgs->count; k++)
+  {
+    dt_image_box *box = &imgs->box[k];
+    free(box->buf);
+    box->buf = NULL;
+    g_clear_pointer(&box->source_icc_blob, g_bytes_unref);
+  }
+}
+
+gboolean dt_printing_remove_box(dt_images_box *imgs, const int box_index)
+{
+  if(!imgs || box_index < 0 || box_index >= imgs->count
+     || imgs->count > MAX_IMAGE_PER_PAGE)
+    return FALSE;
+
+  dt_printing_clear_box(&imgs->box[box_index]);
+  const int boxes_to_shift = imgs->count - box_index - 1;
+  if(boxes_to_shift > 0)
+    memmove(&imgs->box[box_index], &imgs->box[box_index + 1],
+            boxes_to_shift * sizeof(dt_image_box));
+
+  dt_image_box *const tail = &imgs->box[imgs->count - 1];
+  memset(tail, 0, sizeof(*tail));
+  dt_printing_clear_box(tail);
+  imgs->count--;
+  return TRUE;
 }
 
 int32_t dt_printing_get_image_box(const dt_images_box *imgs,
@@ -235,6 +291,7 @@ void _align_pos(const dt_image_pos *ref,
       pos->y = ref->y + (ref->height - height) / 2;
       break;
     case ALIGNMENT_CENTER:
+    default:
       pos->x = ref->x + (ref->width - width) / 2;
       pos->y = ref->y + (ref->height - height) / 2;
       break;

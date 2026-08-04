@@ -21,6 +21,9 @@
 #include "common/darktable.h"
 #include "common/debug.h"
 #include "common/image_cache.h"
+#ifdef HAVE_PRINT
+#include "common/print_backend.h"
+#endif
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -204,8 +207,7 @@ void dt_control_init(const gboolean withgui)
   s->widget_definitions = g_ptr_array_new ();
   s->input_drivers = NULL;
   dt_atomic_set_int(&s->quitting, 0);
-  dt_atomic_set_int(&s->pending_jobs, 0);
-  s->cups_started = FALSE;
+    dt_atomic_set_int(&s->pending_jobs, 0);
 
   dt_action_define_fallback(DT_ACTION_TYPE_IOP, &dt_action_def_iop);
   dt_action_define_fallback(DT_ACTION_TYPE_LIB, &dt_action_def_lib);
@@ -368,10 +370,11 @@ void dt_control_quit()
 
 #ifdef HAVE_PRINT
   dt_printers_abort_discovery();
-  // Cups timeout could be pretty long, at least 30seconds
-  // but don't rely on cups returning correctly so a timeout
-  for(int i = 0; i < 40000 && !dc->cups_started; i++)
-    g_usleep(1000);
+  // Printer discovery can block in platform APIs. Keep a bounded wait
+  // for backends that require it.
+  if(dt_printers_discovery_shutdown_wait_required())
+    for(int i = 0; i < 40000 && !dt_printers_discovery_is_settled(); i++)
+      g_usleep(1000);
 #endif
 
   // We test pending jobs vs 1 as we always accept one DT_JOB_QUEUE_SYSTEM_FG job

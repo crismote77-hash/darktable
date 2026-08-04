@@ -70,8 +70,9 @@ Requirements
 
 *Both darktable and the libraries it uses are developed on the Linux platform.
 Therefore, other platforms MAY have additional bugs that are not present in the Linux version.
-In addition, for example, on the Windows platform, printing support is not currently implemented.
-So we recommend, if you have a choice of platform, to use darktable on Linux.*
+On Windows, printing uses installed Windows printer drivers; physical-printer acceptance and
+universal driver or color fidelity are not claimed. So we recommend, if you have a choice of
+platform, to use darktable on Linux.*
 
 ### Hardware
 

@@ -18,7 +18,7 @@
 
 /** this is the view for the print module.  */
 #include "common/collection.h"
-#include "common/cups_print.h"
+#include "common/print_backend.h"
 #include "common/printing.h"
 #include "common/darktable.h"
 #include "common/debug.h"

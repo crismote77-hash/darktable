@@ -24,7 +24,7 @@
 #include "common/image.h"
 #include "common/mipmap_cache.h"
 #ifdef HAVE_PRINT
-#include "common/cups_print.h"
+#include "common/print_backend.h"
 #include "common/printing.h"
 #endif
 #ifdef HAVE_MAP
