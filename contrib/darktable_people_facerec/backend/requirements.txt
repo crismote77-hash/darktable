@@ -1,0 +1,5 @@
+# Placeholder for phase-1 local backend dependencies.
+# Current pilot backend is stdlib-only and intentionally has no hard dependency.
+opencv-python>=4
+onnxruntime>=1.16
+numpy>=2.0
